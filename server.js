@@ -826,7 +826,7 @@ function send(res, code, obj) {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Client',
     'Cache-Control': 'no-store',
   });
   res.end(body);
@@ -848,14 +848,25 @@ const server = http.createServer(async (req, res) => {
     const p = u.pathname.replace(/\/+$/, '') || '/';
     if (req.method === 'OPTIONS') return send(res, 204, {});
 
+    /* Every browser sends its own random id. Live draws belong to the browser that added them, so nobody sees or changes anyone else's. */
+    const me = (() => { const v = String(req.headers['x-client'] || ''); return /^[\w-]{8,64}$/.test(v) ? v : ''; })();
+    const mine = (d) => d.owner === me;
+    if (p.startsWith('/api/draws') && !me) return send(res, 400, { error: 'Missing client id. Reload the page.' });
+
     if (req.method === 'GET' && (p === '/' || p === '/index.html')) {
-      const f = fs.readdirSync(__dirname).filter((n) => /^Pool_Builder.*\.html$/i.test(n)).sort((a, b) => fs.statSync(path.join(__dirname, a)).mtimeMs - fs.statSync(path.join(__dirname, b)).mtimeMs).pop();
+      const ver = (n) => +((n.match(/v(\d+)/i) || [])[1] || 0);
+      const f = fs.readdirSync(__dirname).filter((n) => /^Pool_Builder.*\.html$/i.test(n)).sort((a, b) => ver(a) - ver(b) || fs.statSync(path.join(__dirname, a)).mtimeMs - fs.statSync(path.join(__dirname, b)).mtimeMs).pop();
       if (!f) return send(res, 404, { error: 'Put Pool_Builder_v9.html in the same folder as server.js' });
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(fs.readFileSync(path.join(__dirname, f)));
     }
     if (req.method === 'GET' && p === '/api/health') return send(res, 200, { ok: true, draws: draws.length });
-    if (req.method === 'GET' && p === '/api/draws') return send(res, 200, { draws: draws.map(pub), nextSync, serverTime: Date.now() });
+    if (req.method === 'GET' && p === '/api/draws') {
+      let claimed = false;
+      draws.forEach((d) => { if (!d.owner) { d.owner = me; claimed = true; } });   // draws saved before this existed go to the first person who opens the site
+      if (claimed) saveDraws();
+      return send(res, 200, { draws: draws.filter(mine).map(pub), nextSync, serverTime: Date.now() });
+    }
 
     if (req.method === 'POST' && p === '/api/draws') {
       const b = await readBody(req);
@@ -863,9 +874,9 @@ const server = http.createServer(async (req, res) => {
       if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
       if (!isMajestri(url)) return send(res, 400, { error: 'That does not look like a Majestri link (https://vq.majestri.com.au/…).' });
       const clean = new URL(url); clean.hash = '';
-      if (draws.some((d) => d.url === clean.href)) return send(res, 409, { error: 'That tournament has already been added.' });
+      if (draws.some((d) => mine(d) && d.url === clean.href)) return send(res, 409, { error: 'That tournament has already been added.' });
       const size = +b.size === 20 ? 20 : 16;
-      const d = { id: uid(), url: clean.href, size, title: 'Loading tournament…', status: 'syncing', error: null, warnings: [], createdAt: Date.now(), lastSync: null, teams: [], pool: [], wildcards: {}, syncWarnings: [] };
+      const d = { id: uid(), owner: me, url: clean.href, size, title: 'Loading tournament…', status: 'syncing', error: null, warnings: [], createdAt: Date.now(), lastSync: null, teams: [], pool: [], wildcards: {}, syncWarnings: [] };
       draws.push(d); saveDraws();
       syncDraw(d);
       return send(res, 201, { draw: pub(d) });
@@ -873,7 +884,7 @@ const server = http.createServer(async (req, res) => {
 
     let m = p.match(/^\/api\/draws\/([\w-]+)\/wildcard$/);
     if (m && req.method === 'POST') {
-      const d = draws.find((x) => x.id === m[1]);
+      const d = draws.find((x) => x.id === m[1] && mine(x));
       if (!d) return send(res, 404, { error: 'Not found' });
       const b = await readBody(req);
       const t = (d.pool || []).find((x) => x.key === b.key);
@@ -889,7 +900,7 @@ const server = http.createServer(async (req, res) => {
 
     m = p.match(/^\/api\/draws\/([\w-]+)(\/refresh)?$/);
     if (m) {
-      const d = draws.find((x) => x.id === m[1]);
+      const d = draws.find((x) => x.id === m[1] && mine(x));
       if (!d) return send(res, 404, { error: 'Not found' });
       if (req.method === 'DELETE' && !m[2]) { draws = draws.filter((x) => x !== d); saveDraws(); return send(res, 200, { ok: true }); }
       if (req.method === 'POST' && m[2]) { syncDraw(d); return send(res, 202, { draw: pub(d) }); }
